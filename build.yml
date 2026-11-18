@@ -1,0 +1,48 @@
+name: Build JC4827W543 Firmware
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO and esptool
+        run: |
+          pip install --upgrade pip
+          pip install platformio esptool
+
+      - name: Build Firmware
+        run: pio run
+
+      - name: Merge Full Binary (0x0000)
+        run: |
+          esptool.py --chip esp32s3 merge_bin \
+            -o JC4827W543-merged-0x0.bin \
+            --flash_mode qio \
+            --flash_freq 80m \
+            --flash_size 4MB \
+            0x0000 .pio/build/jc4827w543/bootloader.bin \
+            0x8000 .pio/build/jc4827w543/partitions.bin \
+            0xe000 ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin \
+            0x10000 .pio/build/jc4827w543/firmware.bin
+
+      - name: Upload Merged Firmware Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: JC4827W543-Firmware-Pack
+          path: |
+            JC4827W543-merged-0x0.bin
+            .pio/build/jc4827w543/bootloader.bin
+            .pio/build/jc4827w543/partitions.bin
+            .pio/build/jc4827w543/firmware.bin
