@@ -29,7 +29,7 @@ jobs:
       - name: Merge Binaries into Single Flashable File (0x0)
         run: |
           esptool.py --chip esp32s3 merge_bin -o JC4827W543-merged-0x0.bin \
-            --flash_mode qio --flash_freq 80m --flash_size 4MB \
+            --flash_mode dio --flash_freq 40m --flash_size 4MB \
             0x0000 .pio/build/jc4827w543/bootloader.bin \
             0x8000 .pio/build/jc4827w543/partitions.bin \
             0xe000 ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin \
