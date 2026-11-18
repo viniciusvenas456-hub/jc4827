@@ -570,6 +570,7 @@ void setup() {
 }
 
 void loop() {
+    lv_tick_inc(5);
     lv_timer_handler();
     if (millis() - last_poll > 1500) {
         last_poll = millis();
