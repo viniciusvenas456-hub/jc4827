@@ -2,18 +2,17 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <Wire.h>
 #include <Arduino_GFX_Library.h>
 #include <lvgl.h>
-#include <Wire.h>
-#include <TAMC_GT911.h>
 
 // ================= CONFIGURAÇÕES DE REDE =================
 const char* WIFI_SSID = "SUA_REDE_WIFI";
 const char* WIFI_PASS = "SUA_SENHA_WIFI";
-String MOONRAKER_IP   = "192.168.1.100"; // Coloque o IP do seu Klipper
+String MOONRAKER_IP   = "192.168.1.100"; // IP do seu Klipper
 const int MOONRAKER_PORT = 7125;
 
-// ================= PINOS OFICIAIS (DO SEU JSON) =================
+// ================= PINOS OFICIAIS JC4827W543 =================
 #define LCD_CS  45
 #define LCD_CLK 47
 #define LCD_D0  21
@@ -25,12 +24,84 @@ const int MOONRAKER_PORT = 7125;
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(LCD_CS, LCD_CLK, LCD_D0, LCD_D1, LCD_D2, LCD_D3);
 Arduino_GFX *gfx = new Arduino_NV3041A(bus, GFX_NOT_DEFINED, 0 /* rotação */, true /* IPS */);
 
-// Touch Capacitivo GT911 (JC4827W543C)
+// ================= DRIVER I2C GT911 SEGURO =================
 #define TOUCH_SDA  8
 #define TOUCH_SCL  4
 #define TOUCH_INT  3
 #define TOUCH_RST 38
-TAMC_GT911 ts = TAMC_GT911(TOUCH_SDA, TOUCH_SCL, TOUCH_INT, TOUCH_RST, 480, 272);
+#define GT911_ADDR1 0x5D
+#define GT911_ADDR2 0x14
+
+uint8_t gt911_addr = 0;
+
+void gt911_write_reg(uint16_t reg, uint8_t val) {
+    if (!gt911_addr) return;
+    Wire.beginTransmission(gt911_addr);
+    Wire.write(reg >> 8);
+    Wire.write(reg & 0xFF);
+    Wire.write(val);
+    Wire.endTransmission();
+}
+
+bool gt911_read_regs(uint16_t reg, uint8_t *buf, uint8_t len) {
+    if (!gt911_addr) return false;
+    Wire.beginTransmission(gt911_addr);
+    Wire.write(reg >> 8);
+    Wire.write(reg & 0xFF);
+    if (Wire.endTransmission(false) != 0) return false;
+    uint8_t got = Wire.requestFrom(gt911_addr, len);
+    if (got < len) return false;
+    for (int i = 0; i < len; i++) {
+        buf[i] = Wire.read();
+    }
+    return true;
+}
+
+void gt911_init() {
+    pinMode(TOUCH_RST, OUTPUT);
+    pinMode(TOUCH_INT, OUTPUT);
+    digitalWrite(TOUCH_RST, LOW);
+    digitalWrite(TOUCH_INT, LOW);
+    delay(20);
+    digitalWrite(TOUCH_RST, HIGH);
+    delay(50);
+    pinMode(TOUCH_INT, INPUT);
+
+    Wire.begin(TOUCH_SDA, TOUCH_SCL, 400000);
+    Wire.setTimeOut(50);
+
+    Wire.beginTransmission(GT911_ADDR1);
+    if (Wire.endTransmission() == 0) {
+        gt911_addr = GT911_ADDR1;
+    } else {
+        Wire.beginTransmission(GT911_ADDR2);
+        if (Wire.endTransmission() == 0) {
+            gt911_addr = GT911_ADDR2;
+        }
+    }
+}
+
+bool gt911_get_touch(uint16_t *x, uint16_t *y) {
+    if (!gt911_addr) return false;
+    uint8_t status = 0;
+    if (!gt911_read_regs(0x814E, &status, 1)) return false;
+
+    if ((status & 0x80) && ((status & 0x0F) > 0)) {
+        uint8_t data[4] = {0};
+        if (gt911_read_regs(0x8150, data, 4)) {
+            uint16_t raw_x = data[0] | (data[1] << 8);
+            uint16_t raw_y = data[2] | (data[3] << 8);
+            gt911_write_reg(0x814E, 0);
+            *x = raw_x;
+            *y = raw_y;
+            return true;
+        }
+    }
+    if (status & 0x80) {
+        gt911_write_reg(0x814E, 0);
+    }
+    return false;
+}
 
 // ================= VARIÁVEIS LVGL E LAYOUT CYD =================
 #define SCREEN_W 480
@@ -39,16 +110,14 @@ TAMC_GT911 ts = TAMC_GT911(TOUCH_SDA, TOUCH_SCL, TOUCH_INT, TOUCH_RST, 480, 272)
 #define GAP_PX 8
 
 static lv_disp_draw_buf_t draw_buf;
-static lv_color_t *disp_draw_buf;
+static lv_color_t *disp_draw_buf = nullptr;
 static lv_disp_drv_t disp_drv;
 
-// Containers das Abas
 lv_obj_t *panel_temp;
 lv_obj_t *panel_move;
 lv_obj_t *panel_macros;
 lv_obj_t *panel_sys;
 
-// Elementos de Interface atualizados via Moonraker
 lv_obj_t *lbl_noz_val;
 lv_obj_t *lbl_bed_val;
 lv_obj_t *lbl_state;
@@ -61,7 +130,7 @@ lv_obj_t *macro_grid;
 float current_step = 10.0;
 bool macros_loaded = false;
 
-// ================= DRIVERS DE TELA E TOUCH =================
+// ================= CALLBACKS DE HARDWARE LVGL =================
 void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
     uint32_t w = (area->x2 - area->x1 + 1);
     uint32_t h = (area->y2 - area->y1 + 1);
@@ -70,11 +139,11 @@ void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color
 }
 
 void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
-    ts.read();
-    if (ts.isTouched) {
+    uint16_t tx = 0, ty = 0;
+    if (gt911_get_touch(&tx, &ty)) {
         data->state = LV_INDEV_STATE_PR;
-        data->point.x = ts.points[0].x;
-        data->point.y = ts.points[0].y;
+        data->point.x = constrain(tx, 0, SCREEN_W - 1);
+        data->point.y = constrain(ty, 0, SCREEN_H - 1);
     } else {
         data->state = LV_INDEV_STATE_REL;
     }
@@ -85,9 +154,10 @@ void send_gcode(String script) {
     if (WiFi.status() != WL_CONNECTED) return;
     HTTPClient http;
     script.replace(" ", "%20");
+    script.replace("\n", "%0A");
     String url = "http://" + MOONRAKER_IP + ":" + String(MOONRAKER_PORT) + "/printer/gcode/script?script=" + script;
     http.begin(url);
-    http.setTimeout(800);
+    http.setTimeout(600);
     http.POST("");
     http.end();
 }
@@ -97,14 +167,14 @@ void send_post_endpoint(String endpoint) {
     HTTPClient http;
     String url = "http://" + MOONRAKER_IP + ":" + String(MOONRAKER_PORT) + endpoint;
     http.begin(url);
-    http.setTimeout(800);
+    http.setTimeout(600);
     http.POST("");
     http.end();
 }
 
-// ================= CALLBACKS DA INTERFACE =================
+// ================= EVENTOS DOS BOTÕES =================
 static void switch_tab_cb(lv_event_t *e) {
-    int tab = (int)(intptr_t)lv_event_get_user_data(e);
+    intptr_t tab = (intptr_t)lv_event_get_user_data(e);
     lv_obj_add_flag(panel_temp, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(panel_move, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(panel_macros, LV_OBJ_FLAG_HIDDEN);
@@ -118,12 +188,12 @@ static void switch_tab_cb(lv_event_t *e) {
 
 static void gcode_btn_cb(lv_event_t *e) {
     const char* cmd = (const char*)lv_event_get_user_data(e);
-    send_gcode(String(cmd));
+    if (cmd) send_gcode(String(cmd));
 }
 
 static void move_axis_cb(lv_event_t *e) {
-    const char* axis_dir = (const char*)lv_event_get_user_data(e); 
-    // Exemplo: "X+" ou "Z-"
+    const char* axis_dir = (const char*)lv_event_get_user_data(e);
+    if (!axis_dir) return;
     char axis = axis_dir[0];
     char dir  = axis_dir[1];
     float dist = (dir == '-') ? -current_step : current_step;
@@ -133,7 +203,7 @@ static void move_axis_cb(lv_event_t *e) {
 }
 
 static void step_select_cb(lv_event_t *e) {
-    int step_val = (int)(intptr_t)lv_event_get_user_data(e);
+    intptr_t step_val = (intptr_t)lv_event_get_user_data(e);
     current_step = (float)step_val;
 }
 
@@ -149,7 +219,6 @@ static void estop_cb(lv_event_t *e) {
     send_post_endpoint("/printer/emergency_stop");
 }
 
-// Função auxiliar para criar botões estilizados padrão CYD-Klipper
 lv_obj_t* create_cyd_btn(lv_obj_t *parent, const char* text, int w, int h, uint32_t color_hex, lv_event_cb_t cb, void* user_data) {
     lv_obj_t *btn = lv_btn_create(parent);
     lv_obj_set_size(btn, w, h);
@@ -163,13 +232,13 @@ lv_obj_t* create_cyd_btn(lv_obj_t *parent, const char* text, int w, int h, uint3
     return btn;
 }
 
-// ================= CONSTRUÇÃO DO LAYOUT CYD-KLIPPER =================
+// ================= INTERFACE COMPLETA ESTILO CYD-KLIPPER =================
 void build_cyd_klipper_ui() {
     lv_obj_t *scr = lv_scr_act();
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x121212), 0);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-    // 1. SIDEBAR LATERAL ESQUERDA (50px conforme seu JSON)
+    // 1. Barra Lateral (50px conforme JSON)
     lv_obj_t *sidebar = lv_obj_create(scr);
     lv_obj_set_size(sidebar, SIDEBAR_W, SCREEN_H);
     lv_obj_align(sidebar, LV_ALIGN_LEFT_MID, 0, 0);
@@ -180,11 +249,11 @@ void build_cyd_klipper_ui() {
     lv_obj_set_flex_flow(sidebar, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(sidebar, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    create_cyd_btn(sidebar, LV_SYMBOL_CHARGE, 42, 48, 0x2979FF, switch_tab_cb, (void*)0);
-    create_cyd_btn(sidebar, LV_SYMBOL_HOME,   42, 48, 0x37474F, switch_tab_cb, (void*)1);
-    create_cyd_btn(sidebar, LV_SYMBOL_LIST,   42, 48, 0x37474F, switch_tab_cb, (void*)2);
-    create_cyd_btn(sidebar, LV_SYMBOL_SETTINGS, 42, 48, 0x37474F, switch_tab_cb, (void*)3);
-    create_cyd_btn(sidebar, LV_SYMBOL_WARNING, 42, 48, 0xD50000, estop_cb, NULL);
+    create_cyd_btn(sidebar, LV_SYMBOL_CHARGE,   42, 46, 0x2979FF, switch_tab_cb, (void*)0);
+    create_cyd_btn(sidebar, LV_SYMBOL_HOME,     42, 46, 0x37474F, switch_tab_cb, (void*)1);
+    create_cyd_btn(sidebar, LV_SYMBOL_LIST,     42, 46, 0x37474F, switch_tab_cb, (void*)2);
+    create_cyd_btn(sidebar, LV_SYMBOL_SETTINGS, 42, 46, 0x37474F, switch_tab_cb, (void*)3);
+    create_cyd_btn(sidebar, LV_SYMBOL_WARNING,  42, 46, 0xD50000, estop_cb, NULL);
 
     int content_w = SCREEN_W - SIDEBAR_W;
 
@@ -198,13 +267,12 @@ void build_cyd_klipper_ui() {
     lv_obj_clear_flag(panel_temp, LV_OBJ_FLAG_SCROLLABLE);
 
     lbl_state = lv_label_create(panel_temp);
-    lv_label_set_text(lbl_state, "Conectando ao Klipper...");
+    lv_label_set_text(lbl_state, "Iniciando CYD-Klipper...");
     lv_obj_set_style_text_color(lbl_state, lv_color_hex(0x00E676), 0);
     lv_obj_align(lbl_state, LV_ALIGN_TOP_LEFT, 4, 2);
 
-    // Card Hotend
     lv_obj_t *c_noz = lv_obj_create(panel_temp);
-    lv_obj_set_size(c_noz, 200, 85);
+    lv_obj_set_size(c_noz, 200, 82);
     lv_obj_align(c_noz, LV_ALIGN_TOP_LEFT, 0, 26);
     lv_obj_set_style_bg_color(c_noz, lv_color_hex(0x1E1E1E), 0);
     lv_obj_set_style_border_color(c_noz, lv_color_hex(0xFF5252), 0);
@@ -222,9 +290,8 @@ void build_cyd_klipper_ui() {
     lv_obj_set_style_text_color(lbl_noz_val, lv_color_hex(0xFFFFFF), 0);
     lv_obj_align(lbl_noz_val, LV_ALIGN_BOTTOM_MID, 0, 2);
 
-    // Card Mesa
     lv_obj_t *c_bed = lv_obj_create(panel_temp);
-    lv_obj_set_size(c_bed, 200, 85);
+    lv_obj_set_size(c_bed, 200, 82);
     lv_obj_align(c_bed, LV_ALIGN_TOP_RIGHT, 0, 26);
     lv_obj_set_style_bg_color(c_bed, lv_color_hex(0x1E1E1E), 0);
     lv_obj_set_style_border_color(c_bed, lv_color_hex(0x40C4FF), 0);
@@ -242,10 +309,9 @@ void build_cyd_klipper_ui() {
     lv_obj_set_style_text_color(lbl_bed_val, lv_color_hex(0xFFFFFF), 0);
     lv_obj_align(lbl_bed_val, LV_ALIGN_BOTTOM_MID, 0, 2);
 
-    // Barra de Progresso de Impressão
     bar_progress = lv_bar_create(panel_temp);
-    lv_obj_set_size(bar_progress, 410, 22);
-    lv_obj_align(bar_progress, LV_ALIGN_TOP_MID, 0, 122);
+    lv_obj_set_size(bar_progress, 410, 20);
+    lv_obj_align(bar_progress, LV_ALIGN_TOP_MID, 0, 118);
     lv_bar_set_range(bar_progress, 0, 100);
     lv_bar_set_value(bar_progress, 0, LV_ANIM_OFF);
 
@@ -253,22 +319,20 @@ void build_cyd_klipper_ui() {
     lv_label_set_text(lbl_progress, "Progresso: 0%");
     lv_obj_set_style_text_font(lbl_progress, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(lbl_progress, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_align(lbl_progress, LV_ALIGN_TOP_MID, 0, 125);
+    lv_obj_align(lbl_progress, LV_ALIGN_TOP_MID, 0, 120);
 
-    // Presets Rápidos de Temperatura (PLA, PETG, ABS, ESFRIAR)
-    lv_obj_t *b_pla = create_cyd_btn(panel_temp, "PLA\n200/60", 96, 52, 0x2E7D32, gcode_btn_cb, (void*)"M104 S200\nM140 S60");
-    lv_obj_align(b_pla, LV_ALIGN_BOTTOM_LEFT, 0, -52);
+    lv_obj_t *b_pla = create_cyd_btn(panel_temp, "PLA 200/60", 96, 50, 0x2E7D32, gcode_btn_cb, (void*)"M104 S200\nM140 S60");
+    lv_obj_align(b_pla, LV_ALIGN_BOTTOM_LEFT, 0, -50);
 
-    lv_obj_t *b_petg = create_cyd_btn(panel_temp, "PETG\n235/75", 96, 52, 0xEF6C00, gcode_btn_cb, (void*)"M104 S235\nM140 S75");
-    lv_obj_align(b_petg, LV_ALIGN_BOTTOM_LEFT, 104, -52);
+    lv_obj_t *b_petg = create_cyd_btn(panel_temp, "PETG 235/75", 96, 50, 0xEF6C00, gcode_btn_cb, (void*)"M104 S235\nM140 S75");
+    lv_obj_align(b_petg, LV_ALIGN_BOTTOM_LEFT, 104, -50);
 
-    lv_obj_t *b_abs = create_cyd_btn(panel_temp, "ABS\n250/100", 96, 52, 0xC62828, gcode_btn_cb, (void*)"M104 S250\nM140 S100");
-    lv_obj_align(b_abs, LV_ALIGN_BOTTOM_LEFT, 208, -52);
+    lv_obj_t *b_abs = create_cyd_btn(panel_temp, "ABS 250/100", 96, 50, 0xC62828, gcode_btn_cb, (void*)"M104 S250\nM140 S100");
+    lv_obj_align(b_abs, LV_ALIGN_BOTTOM_LEFT, 208, -50);
 
-    lv_obj_t *b_cool = create_cyd_btn(panel_temp, "ESFRIAR", 98, 52, 0x0277BD, gcode_btn_cb, (void*)"TURN_OFF_HEATERS");
-    lv_obj_align(b_cool, LV_ALIGN_BOTTOM_RIGHT, 0, -52);
+    lv_obj_t *b_cool = create_cyd_btn(panel_temp, "ESFRIAR", 98, 50, 0x0277BD, gcode_btn_cb, (void*)"TURN_OFF_HEATERS");
+    lv_obj_align(b_cool, LV_ALIGN_BOTTOM_RIGHT, 0, -50);
 
-    // Controle de Impressão na base
     lv_obj_t *b_pause = create_cyd_btn(panel_temp, "PAUSAR", 132, 42, 0x455A64, gcode_btn_cb, (void*)"PAUSE");
     lv_obj_align(b_pause, LV_ALIGN_BOTTOM_LEFT, 0, 0);
 
@@ -278,7 +342,7 @@ void build_cyd_klipper_ui() {
     lv_obj_t *b_cancel = create_cyd_btn(panel_temp, "CANCELAR", 132, 42, 0xB71C1C, gcode_btn_cb, (void*)"CANCEL_PRINT");
     lv_obj_align(b_cancel, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
 
-    // ---------------- ABA 1: MOVIMENTAÇÃO E HOME (X/Y/Z) ----------------
+    // ---------------- ABA 1: MOVIMENTAÇÃO ----------------
     panel_move = lv_obj_create(scr);
     lv_obj_set_size(panel_move, content_w, SCREEN_H);
     lv_obj_align(panel_move, LV_ALIGN_RIGHT_MID, 0, 0);
@@ -292,14 +356,13 @@ void build_cyd_klipper_ui() {
     lv_obj_set_style_text_color(lbl_pos_xyz, lv_color_hex(0x00E676), 0);
     lv_obj_align(lbl_pos_xyz, LV_ALIGN_TOP_LEFT, 4, 2);
 
-    // Grade Direcional
     lv_obj_t *b_yp = create_cyd_btn(panel_move, "Y+", 64, 52, 0x37474F, move_axis_cb, (void*)"Y+");
     lv_obj_align(b_yp, LV_ALIGN_TOP_LEFT, 70, 30);
 
     lv_obj_t *b_xm = create_cyd_btn(panel_move, "X-", 64, 52, 0x37474F, move_axis_cb, (void*)"X-");
     lv_obj_align(b_xm, LV_ALIGN_TOP_LEFT, 0, 88);
 
-    lv_obj_t *b_hall = create_cyd_btn(panel_move, "HOME\nALL", 64, 52, 0x2979FF, gcode_btn_cb, (void*)"G28");
+    lv_obj_t *b_hall = create_cyd_btn(panel_move, "G28", 64, 52, 0x2979FF, gcode_btn_cb, (void*)"G28");
     lv_obj_align(b_hall, LV_ALIGN_TOP_LEFT, 70, 88);
 
     lv_obj_t *b_xp = create_cyd_btn(panel_move, "X+", 64, 52, 0x37474F, move_axis_cb, (void*)"X+");
@@ -308,24 +371,21 @@ void build_cyd_klipper_ui() {
     lv_obj_t *b_ym = create_cyd_btn(panel_move, "Y-", 64, 52, 0x37474F, move_axis_cb, (void*)"Y-");
     lv_obj_align(b_ym, LV_ALIGN_TOP_LEFT, 70, 146);
 
-    // Eixo Z
-    lv_obj_t *b_zp = create_cyd_btn(panel_move, "Z+ (Desce)", 95, 52, 0x37474F, move_axis_cb, (void*)"Z+");
+    lv_obj_t *b_zp = create_cyd_btn(panel_move, "Z+ Desce", 95, 52, 0x37474F, move_axis_cb, (void*)"Z+");
     lv_obj_align(b_zp, LV_ALIGN_TOP_LEFT, 220, 30);
 
-    lv_obj_t *b_zm = create_cyd_btn(panel_move, "Z- (Sobe)", 95, 52, 0x37474F, move_axis_cb, (void*)"Z-");
+    lv_obj_t *b_zm = create_cyd_btn(panel_move, "Z- Sobe", 95, 52, 0x37474F, move_axis_cb, (void*)"Z-");
     lv_obj_align(b_zm, LV_ALIGN_TOP_LEFT, 220, 146);
 
-    // Homes individuais
     lv_obj_t *b_hx = create_cyd_btn(panel_move, "Home XY", 85, 52, 0x1565C0, gcode_btn_cb, (void*)"G28 X Y");
     lv_obj_align(b_hx, LV_ALIGN_TOP_RIGHT, 0, 30);
 
     lv_obj_t *b_hz = create_cyd_btn(panel_move, "Home Z", 85, 52, 0x1565C0, gcode_btn_cb, (void*)"G28 Z");
     lv_obj_align(b_hz, LV_ALIGN_TOP_RIGHT, 0, 88);
 
-    lv_obj_t *b_off = create_cyd_btn(panel_move, "Motores\nOFF", 85, 52, 0x455A64, gcode_btn_cb, (void*)"M84");
+    lv_obj_t *b_off = create_cyd_btn(panel_move, "M84 OFF", 85, 52, 0x455A64, gcode_btn_cb, (void*)"M84");
     lv_obj_align(b_off, LV_ALIGN_TOP_RIGHT, 0, 146);
 
-    // Seleção de Passo (1mm, 10mm, 50mm)
     lv_obj_t *b_s1 = create_cyd_btn(panel_move, "Passo 1mm", 130, 42, 0x263238, step_select_cb, (void*)1);
     lv_obj_align(b_s1, LV_ALIGN_BOTTOM_LEFT, 0, 0);
 
@@ -335,7 +395,7 @@ void build_cyd_klipper_ui() {
     lv_obj_t *b_s50 = create_cyd_btn(panel_move, "Passo 50mm", 130, 42, 0x263238, step_select_cb, (void*)50);
     lv_obj_align(b_s50, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
 
-    // ---------------- ABA 2: MACROS DO KLIPPER ----------------
+    // ---------------- ABA 2: MACROS ----------------
     panel_macros = lv_obj_create(scr);
     lv_obj_set_size(panel_macros, content_w, SCREEN_H);
     lv_obj_align(panel_macros, LV_ALIGN_RIGHT_MID, 0, 0);
@@ -345,7 +405,7 @@ void build_cyd_klipper_ui() {
     lv_obj_add_flag(panel_macros, LV_OBJ_FLAG_HIDDEN);
 
     lv_obj_t *lbl_m_title = lv_label_create(panel_macros);
-    lv_label_set_text(lbl_m_title, "Macros do Klipper (Carregadas via API):");
+    lv_label_set_text(lbl_m_title, "Macros do Klipper:");
     lv_obj_set_style_text_color(lbl_m_title, lv_color_hex(0xFFFFFF), 0);
     lv_obj_align(lbl_m_title, LV_ALIGN_TOP_LEFT, 4, 2);
 
@@ -359,7 +419,7 @@ void build_cyd_klipper_ui() {
     lv_obj_set_style_pad_all(macro_grid, 6, 0);
     lv_obj_set_style_pad_gap(macro_grid, 8, 0);
 
-    // ---------------- ABA 3: SISTEMA E REINICIALIZAÇÃO ----------------
+    // ---------------- ABA 3: SISTEMA ----------------
     panel_sys = lv_obj_create(scr);
     lv_obj_set_size(panel_sys, content_w, SCREEN_H);
     lv_obj_align(panel_sys, LV_ALIGN_RIGHT_MID, 0, 0);
@@ -369,7 +429,7 @@ void build_cyd_klipper_ui() {
     lv_obj_add_flag(panel_sys, LV_OBJ_FLAG_HIDDEN);
 
     lbl_ip_info = lv_label_create(panel_sys);
-    lv_label_set_text(lbl_ip_info, "Wi-Fi: Conectando...");
+    lv_label_set_text(lbl_ip_info, "Conectando ao Wi-Fi...");
     lv_obj_set_style_text_color(lbl_ip_info, lv_color_hex(0x00E676), 0);
     lv_obj_align(lbl_ip_info, LV_ALIGN_TOP_LEFT, 4, 6);
 
@@ -389,7 +449,7 @@ void fetch_klipper_macros() {
     HTTPClient http;
     String url = "http://" + MOONRAKER_IP + ":" + String(MOONRAKER_PORT) + "/printer/objects/list";
     http.begin(url);
-    http.setTimeout(1000);
+    http.setTimeout(800);
     if (http.GET() == 200) {
         JsonDocument doc;
         deserializeJson(doc, http.getString());
@@ -399,8 +459,8 @@ void fetch_klipper_macros() {
             String name = v.as<String>();
             if (name.startsWith("gcode_macro ")) {
                 String macro_name = name.substring(12);
-                if (!macro_name.startsWith("_")) { // Ignora macros ocultas de sistema
-                    create_cyd_btn(macro_grid, macro_name.c_str(), 122, 44, 0x37474F, macro_click_cb, NULL);
+                if (!macro_name.startsWith("_")) {
+                    create_cyd_btn(macro_grid, macro_name.c_str(), 122, 42, 0x37474F, macro_click_cb, NULL);
                 }
             }
         }
@@ -411,11 +471,11 @@ void fetch_klipper_macros() {
 
 void poll_moonraker_status() {
     if (WiFi.status() != WL_CONNECTED) {
-        lv_label_set_text(lbl_state, "Wi-Fi Desconectado...");
+        lv_label_set_text(lbl_state, "Aguardando Wi-Fi...");
         return;
     }
 
-    String ip_txt = "IP da Tela: " + WiFi.localIP().toString() + "  |  Moonraker: " + MOONRAKER_IP;
+    String ip_txt = "IP: " + WiFi.localIP().toString() + " | Host: " + MOONRAKER_IP;
     lv_label_set_text(lbl_ip_info, ip_txt.c_str());
 
     if (!macros_loaded) fetch_klipper_macros();
@@ -453,7 +513,7 @@ void poll_moonraker_status() {
 
         JsonArray pos = status["toolhead"]["position"];
         if (!pos.isNull() && pos.size() >= 3) {
-            snprintf(buf, sizeof(buf), "X: %.1f   Y: %.1f   Z: %.2f   (Passo: %.0fmm)", 
+            snprintf(buf, sizeof(buf), "X: %.1f  Y: %.1f  Z: %.2f (%.0fmm)", 
                      pos[0].as<float>(), pos[1].as<float>(), pos[2].as<float>(), current_step);
             lv_label_set_text(lbl_pos_xyz, buf);
         }
@@ -465,28 +525,26 @@ void poll_moonraker_status() {
 uint32_t last_poll = 0;
 
 void setup() {
-    Serial.begin(115200);
-
-    // Liga o Backlight (Pino 1)
+    // 1. Acende o Backlight IMEDIATAMENTE para confirmar boot
     pinMode(LCD_BL, OUTPUT);
     digitalWrite(LCD_BL, HIGH);
 
-    // Inicia Display QSPI NV3041A
+    Serial.begin(115200);
+    delay(200);
+
+    // 2. Inicia Display NV3041A
     gfx->begin();
-    gfx->fillScreen(BLACK);
+    gfx->fillScreen(0x0000);
 
-    // Inicia Touch GT911
-    Wire.begin(TOUCH_SDA, TOUCH_SCL);
-    ts.begin();
-    ts.setRotation(ROTATION_INVERTED);
+    // 3. Inicia Touch GT911
+    gt911_init();
 
+    // 4. Inicia LVGL com buffer seguro na RAM interna (20 linhas = 19.2KB)
     lv_init();
-
-    // Aloca buffer na RAM interna ou PSRAM OPI
-    uint32_t buf_pixels = SCREEN_W * 40;
+    uint32_t buf_pixels = SCREEN_W * 20;
     disp_draw_buf = (lv_color_t *)heap_caps_malloc(buf_pixels * sizeof(lv_color_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!disp_draw_buf) {
-        disp_draw_buf = (lv_color_t *)heap_caps_malloc(buf_pixels * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+        disp_draw_buf = (lv_color_t *)malloc(buf_pixels * sizeof(lv_color_t));
     }
 
     lv_disp_draw_buf_init(&draw_buf, disp_draw_buf, NULL, buf_pixels);
@@ -505,6 +563,7 @@ void setup() {
     lv_indev_drv_register(&indev_drv);
 
     build_cyd_klipper_ui();
+    lv_timer_handler(); // Renderiza a tela imediatamente antes de ligar o Wi-Fi
 
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
